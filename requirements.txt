@@ -1,5 +1,6 @@
-streamlit>=1.24.0
+streamlit
 numpy
+pillow
 opencv-python-headless
 scikit-image
 matplotlib
