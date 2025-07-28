@@ -1,115 +1,113 @@
 import streamlit as st
 import numpy as np
+from PIL import Image
 import cv2
-from skimage.morphology import skeletonize, closing, remove_small_objects
+from skimage.morphology import (
+    skeletonize,
+    binary_closing,
+    remove_small_objects
+)
 from skimage.filters import threshold_otsu
-from skimage import io
 import matplotlib.pyplot as plt
 
 st.set_page_config(layout="wide")
 st.title("Airflow Vector Comparison (Clean Skeleton)")
 
 st.markdown("""
-Upload two black‑background, white‑line images (prediction & ground truth).  
+Upload **Prediction** and **Ground Truth** images (black bg, white flow lines).  
 This app will:
-1. Binarize with Otsu threshold  
-2. Remove small specks & close gaps  
-3. Skeletonize the clean mask  
-4. Extract local tangent angles (Sobel)  
-5. Mask overlaps & compute Mean Angular Error (°)  
-6. Show skeletons + angular error heatmap  
+1. Load & convert to grayscale  
+2. Binarize (Otsu)  
+3. Remove small specks & close gaps  
+4. Skeletonize  
+5. Compute local tangent angles (Sobel)  
+6. Mask overlaps & report Mean Angular Error (°)  
+7. Show skeletons + angular error heatmap  
 """)
 
-pred_file = st.file_uploader("1. Upload Prediction Image", type=["png","jpg","jpeg"])
-gt_file   = st.file_uploader("2. Upload Ground Truth Image", type=["png","jpg","jpeg"])
+pred_file = st.file_uploader("1. Prediction Image", type=["png","jpg","jpeg"])
+gt_file   = st.file_uploader("2. Ground Truth Image", type=["png","jpg","jpeg"])
 
-def preprocess_clean(img):
-    """
-    1) Convert to grayscale float in [0,1]
-    2) Binarize with Otsu
-    3) Remove small objects
-    4) Close small gaps
-    5) Skeletonize
-    """
-    arr = img
-    # RGB/RGBA → Gray
+def preprocess_clean(arr: np.ndarray) -> np.ndarray:
+    """Return a 1‑px skeleton (uint8) from a uint8 RGB/RGBA or gray array."""
+    # — Convert to single‑channel uint8 gray —
     if arr.ndim == 3:
-        # drop alpha if present
+        # RGBA → RGB
         if arr.shape[2] == 4:
             arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
-        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     else:
-        # already single channel
-        gray = arr.astype(np.float32) / 255.0
+        gray = arr
 
-    # Otsu threshold: white lines = True
-    th = threshold_otsu(gray)
-    binary = gray < th
+    # — Normalize to [0,1] float —
+    gray_f = gray.astype(np.float32) / 255.0
 
-    # Remove tiny specks
+    # — Otsu binarization: white lines => True —
+    th = threshold_otsu(gray_f)
+    binary = gray_f < th
+
+    # — Remove specks, close tiny gaps —
     clean = remove_small_objects(binary, min_size=100)
+    closed = binary_closing(clean, footprint=np.ones((3,3), bool))
 
-    # Close small gaps (3×3 square)
-    closed = closing(clean, selem=np.ones((3,3), dtype=bool))
-
-    # Skeletonize
+    # — Skeletonize and return uint8 mask —
     skel = skeletonize(closed)
-    return skel.astype(np.uint8)
+    return (skel.astype(np.uint8))
 
-def tangent_angles(skel):
-    """Compute local tangent angle (radians) via Sobel gradients."""
+def tangent_angles(skel: np.ndarray) -> np.ndarray:
+    """Compute local tangent angle map (radians) via Sobel."""
     sx = cv2.Sobel(skel.astype(np.float32), cv2.CV_64F, 1, 0, ksize=5)
     sy = cv2.Sobel(skel.astype(np.float32), cv2.CV_64F, 0, 1, ksize=5)
     return np.arctan2(sy, sx)
 
-def angular_error_deg(a_pred, a_gt):
-    """Minimal wrapped difference, in degrees."""
+def angular_error_deg(a_pred: np.ndarray, a_gt: np.ndarray) -> np.ndarray:
+    """Wrapped minimal difference between two angle maps, in degrees."""
     diff = np.abs(a_pred - a_gt)
     diff = np.minimum(diff, 2*np.pi - diff)
     return np.degrees(diff)
 
 if pred_file and gt_file:
-    # Load images as numpy arrays
-    pred_img = io.imread(pred_file)
-    gt_img   = io.imread(gt_file)
+    # — Load via PIL to handle file-like objects —
+    pred_arr = np.array(Image.open(pred_file))
+    gt_arr   = np.array(Image.open(gt_file))
 
-    # Resize prediction → ground truth if needed
-    if pred_img.shape[:2] != gt_img.shape[:2]:
-        st.warning("Resizing prediction to match ground truth shape.")
-        pred_img = cv2.resize(pred_img, (gt_img.shape[1], gt_img.shape[0]))
+    # — Resize prediction to match ground truth if needed —
+    if pred_arr.shape[:2] != gt_arr.shape[:2]:
+        st.warning("Resizing prediction → ground truth size")
+        pred_arr = cv2.resize(pred_arr, (gt_arr.shape[1], gt_arr.shape[0]),
+                              interpolation=cv2.INTER_AREA)
 
-    # Clean skeletons
-    skel_pred = preprocess_clean(pred_img)
-    skel_gt   = preprocess_clean(gt_img)
+    # — Preprocess to skeletons —
+    skel_pred = preprocess_clean(pred_arr)
+    skel_gt   = preprocess_clean(gt_arr)
 
-    # Compute local tangent maps
+    # — Compute tangent maps —
     ang_pred = tangent_angles(skel_pred)
     ang_gt   = tangent_angles(skel_gt)
 
-    # Mask where both skeletons exist
+    # — Mask where both skeletons exist —
     mask = (skel_pred == 1) & (skel_gt == 1)
 
     if not mask.any():
-        st.error("No overlapping skeleton pixels found.")
+        st.error("No overlapping skeleton pixels found. Check your inputs!")
     else:
-        # Compute angular error map & MAE
         err_map = angular_error_deg(ang_pred, ang_gt)
         mae     = err_map[mask].mean()
 
         st.subheader(f"Mean Angular Error: {mae:.2f}°")
 
-        # Display skeletons side by side
-        col1, col2 = st.columns(2)
-        with col1:
+        # — Show skeletons —
+        c1, c2 = st.columns(2)
+        with c1:
             st.image(skel_pred * 255,
-                     caption="Prediction Skeleton (clean)",
+                     caption="Prediction Skeleton",
                      use_column_width=True)
-        with col2:
+        with c2:
             st.image(skel_gt * 255,
-                     caption="Ground Truth Skeleton (clean)",
+                     caption="Ground Truth Skeleton",
                      use_column_width=True)
 
-        # Plot error heatmap
+        # — Error heatmap —
         fig, ax = plt.subplots(figsize=(6,4))
         disp = np.ma.masked_where(~mask, err_map)
         im = ax.imshow(disp, cmap="inferno", vmin=0, vmax=90)
